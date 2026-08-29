@@ -1,0 +1,4 @@
+preset: tga
+modules:
+  psoi: false
+  ncic: false
