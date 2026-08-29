@@ -1,0 +1,11 @@
+species: drosophila
+skeleton_index_base: 0
+keypoints:
+  [mouth, head, back, tail, lefteye, righteye, leftleg1_1, leftleg1_2, leftleg1_3, leftleg2_1,
+   leftleg2_2, leftleg2_3, leftleg3_1, leftleg3_2, leftleg3_3, rightleg1_1, rightleg1_2,
+   rightleg1_3, rightleg2_1, rightleg2_2, rightleg2_3, rightleg3_1, rightleg3_2, rightleg3_3,
+   leftwing, rightwing]
+skeleton:
+  [[0, 1], [1, 2], [2, 3], [0, 4], [0, 5], [1, 24], [1, 25], [6, 7], [7, 8], [9, 10], [10, 11],
+   [12, 13], [13, 14], [15, 16], [16, 17], [18, 19], [19, 20], [21, 22], [22, 23]]
+body_axis: [1, 3]
