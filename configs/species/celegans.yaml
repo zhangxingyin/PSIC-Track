@@ -1,0 +1,7 @@
+species: celegans
+skeleton_index_base: 0
+keypoints:
+  [head, front, middle, back, tail]
+skeleton:
+  [[0, 1], [1, 2], [2, 3], [3, 4]]
+body_axis: [0, 4]
