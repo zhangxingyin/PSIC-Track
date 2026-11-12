@@ -1,0 +1,21 @@
+[
+  {"label":"SORT","directory":"sort","family":"TbD"},
+  {"label":"AdapTrack","directory":"adaptrack","family":"TbD"},
+  {"label":"TOPICTrack","directory":"topictrack","family":"TbD"},
+  {"label":"DeepSORT","directory":"deepsort","family":"TbD"},
+  {"label":"StrongSORT","directory":"strongsort","family":"TbD"},
+  {"label":"FastTracker","directory":"fasttracker","family":"TbD"},
+  {"label":"C-BIoU","directory":"cbiou","family":"TbD"},
+  {"label":"ConfTrack","directory":"conftrack","family":"TbD"},
+  {"label":"UCMCTrack","directory":"ucmctrack","family":"TbD"},
+  {"label":"ByteTrack","directory":"bytetrack","family":"TbD"},
+  {"label":"BoT-SORT","directory":"botsort","family":"TbD"},
+  {"label":"OC-SORT","directory":"ocsort","family":"TbD"},
+  {"label":"SparseTrack","directory":"sparsetrack","family":"TbD"},
+  {"label":"BoostTrack","directory":"boosttrack","family":"TbD"},
+  {"label":"PoseFlow","directory":"poseflow","family":"Pose/keypoint"},
+  {"label":"PoseBYTE","directory":"posebyte","family":"Pose/keypoint"},
+  {"label":"SLEAP-Tracker","directory":"sleap","family":"Pose/keypoint"},
+  {"label":"LightTrack-SGCN","directory":"lighttrack_sgcn","family":"Pose/keypoint"},
+  {"label":"PSIC-Track","directory":"psictrack_ablation_tga_plus_psoi_ncic","family":"Ours","root":"pose_scale_002"}
+]

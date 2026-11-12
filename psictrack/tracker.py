@@ -113,6 +113,47 @@ def _identity_conditioned_multiplicity_energy(
     return conditioned
 
 
+def pairwise_graph_distances(left, right):
+    """Return the exact scalar distance for every pair, including missing data."""
+    result = np.full((len(left), len(right)), np.inf, dtype=np.float64)
+    if not len(left) or not len(right):
+        return result
+    left_indices = [i for i, value in enumerate(left) if value is not None]
+    right_indices = [i for i, value in enumerate(right) if value is not None]
+    if not left_indices or not right_indices:
+        return result
+    left_items, right_items = [left[i] for i in left_indices], [right[i] for i in right_indices]
+    left_mean, right_mean = np.stack([v.mean for v in left_items]), np.stack([v.mean for v in right_items])
+    left_cov, right_cov = np.stack([v.covariance for v in left_items]), np.stack([v.covariance for v in right_items])
+    common = (np.stack([v.valid_mask for v in left_items])[:, None]
+              & np.stack([v.valid_mask for v in right_items])[None, :])
+    bits = 1 << np.arange(8)
+    patterns = np.sum(common * bits, axis=2)
+    for pattern in np.unique(patterns):
+        if pattern == 0:
+            continue
+        rows, columns = np.nonzero(patterns == pattern)
+        indices = np.flatnonzero(pattern & bits)
+        residual = left_mean[rows[:, None], indices] - right_mean[columns[:, None], indices]
+        covariance = (left_cov[rows[:, None, None], indices[None, :, None], indices[None, None, :]]
+                      + right_cov[columns[:, None, None], indices[None, :, None], indices[None, None, :]])
+        covariance += np.eye(len(indices)) * 1e-8
+        try:
+            # Explicit RHS-column axis works in NumPy 1.26 and NumPy 2.x.
+            solved = np.linalg.solve(covariance, residual[..., None])[..., 0]
+            for offset, (row, column) in enumerate(zip(rows, columns)):
+                result[left_indices[row], right_indices[column]] = (
+                    float(residual[offset] @ solved[offset]) / float(len(indices))
+                )
+        except np.linalg.LinAlgError:
+            # A singular member must not invalidate other members of its group.
+            for row, column in zip(rows, columns):
+                result[left_indices[row], right_indices[column]] = graph_pose_distance(
+                    left_items[row], right_items[column],
+                )
+    return result
+
+
 @dataclass(frozen=True)
 class _PredictedBox:
     bbox_xywh: np.ndarray
@@ -578,6 +619,7 @@ class _NearClosedBase:
         self._tracks: list[_IdentityTrack] = []
         self._next_id = 1
         self._last_frame = 0
+        self.last_measurement_context: dict[int, PoseEvidence | None] = {}
         self.last_diagnostics: list[dict[str, object]] = []
 
     def _encode(
@@ -663,22 +705,15 @@ class _NearClosedBase:
             track.predicted_bbox = b0_bbox
             track.time_since_update += delta
 
-    def _association_matrices(
-        self,
-        observations: Sequence[Observation],
-        raw: Sequence[PoseEvidence | None],
-        graph: Sequence[GraphPoseEvidence | None],
-    ) -> dict[str, np.ndarray]:
+    def _association_matrices(self, observations, raw, graph):
+        """Construct association costs from the current identity and candidate evidence."""
         rows, columns = len(self._tracks), len(observations)
         b0_cost = box_cost_matrix(
-            [_PredictedBox(track.b0.bbox_xywh) for track in self._tracks],
-            observations,
-            self.config.base,
+            [_PredictedBox(track.b0.bbox_xywh) for track in self._tracks], observations, self.config.base,
         )
         closed_reacquisition = np.zeros((rows, columns), dtype=bool)
         spatial = b0_cost.copy()
-
-        persistent_columns: set[int] = set()
+        persistent_columns = set()
         if self.config.closed_world.enabled and self._birth_proposals and columns:
             proposal_assignment = solve_assignment(
                 self._proposal_cost_matrix(tuple(range(columns)), observations, graph),
@@ -688,76 +723,44 @@ class _NearClosedBase:
         if self.config.closed_world.enabled:
             for row, track in enumerate(self._tracks):
                 for column, observation in enumerate(observations):
-                    dormant_recovery = track.lifecycle in {
-                        Lifecycle.DORMANT,
-                        Lifecycle.LOST,
-                    }
-                    if (
-                        np.isfinite(spatial[row, column])
-                        or (
-                            not dormant_recovery
-                            and column not in persistent_columns
-                        )
-                    ):
+                    dormant_recovery = track.lifecycle in {Lifecycle.DORMANT, Lifecycle.LOST}
+                    if (np.isfinite(spatial[row, column])
+                        or (not dormant_recovery and column not in persistent_columns)):
                         continue
-                    spatial[row, column] = _closed_world_transport_energy(
-                        track.b0.bbox_xywh, observation.bbox_xywh
-                    )
+                    spatial[row, column] = _closed_world_transport_energy(track.b0.bbox_xywh, observation.bbox_xywh)
                     closed_reacquisition[row, column] = True
 
-        pose_distance = np.full_like(spatial, np.inf)
+        # The anatomical posterior cannot change while this matrix is assembled.
+        identities = [None if track.graph_prediction is None else
+                      (track.graph_memory.anatomical_identity if track.graph_memory is not None
+                       else track.graph_prediction) for track in self._tracks]
+        pose_distance = pairwise_graph_distances(identities, graph)
         pose_support = np.zeros_like(spatial)
-        for row, track in enumerate(self._tracks):
-            for column in range(columns):
-                if track.graph_prediction is not None and graph[column] is not None:
-                    identity_pose = (
-                        track.graph_memory.anatomical_identity
-                        if track.graph_memory is not None
-                        else track.graph_prediction
-                    )
-                    pose_distance[row, column] = graph_pose_distance(
-                        identity_pose, graph[column]
-                    )
-                    pose_support[row, column] = _graph_reliability(
-                        track.graph_prediction, graph[column]
-                    )
+        if columns:
+            masks = np.stack([v.valid_mask if v is not None else np.zeros(8, bool) for v in graph])
+            qualities = np.array([v.quality if v is not None else 0.0 for v in graph])
+            for row, track in enumerate(self._tracks):
+                prediction = track.graph_prediction
+                if prediction is not None:
+                    coverage = np.mean(prediction.valid_mask[None] & masks, axis=1)
+                    pose_support[row] = np.clip(np.sqrt(prediction.quality * qualities) * coverage, 0.0, 1.0)
 
         pose_credibility = np.broadcast_to(
-            np.asarray(
-                [track.pose_credibility.strength for track in self._tracks],
-                dtype=np.float64,
-            )[:, None],
+            np.asarray([track.pose_credibility.strength for track in self._tracks], dtype=np.float64)[:, None],
             spatial.shape,
         ).copy()
         feasible = np.isfinite(spatial)
         ambiguity = ambiguity_scores(spatial, feasible)
         if self.config.association.enabled:
-            combined, pose_term = compose_joint_cost(
-                spatial,
-                pose_distance,
-                ambiguity,
-                pose_support * pose_credibility,
-            )
+            combined, pose_term = compose_joint_cost(spatial, pose_distance, ambiguity, pose_support * pose_credibility)
         else:
-            combined = spatial.copy()
-            pose_term = np.zeros_like(spatial)
-
+            combined, pose_term = spatial.copy(), np.zeros_like(spatial)
         if np.any(closed_reacquisition):
             energy = np.maximum(combined[closed_reacquisition], 0.0)
-            combined[closed_reacquisition] = (
-                self.config.base.max_assignment_cost * energy / (1.0 + energy)
-            )
-        return {
-            "tga": b0_cost,
-            "spatial": spatial,
-            "pose": pose_distance,
-            "pose_support": pose_support,
-            "pose_credibility": pose_credibility,
-            "ambiguity": ambiguity,
-            "pose_term": pose_term,
-            "combined": combined,
-            "closed_reacquisition": closed_reacquisition,
-        }
+            combined[closed_reacquisition] = self.config.base.max_assignment_cost * energy / (1.0 + energy)
+        return dict(tga=b0_cost, spatial=spatial, pose=pose_distance, pose_support=pose_support,
+                    pose_credibility=pose_credibility, ambiguity=ambiguity, pose_term=pose_term,
+                    combined=combined, closed_reacquisition=closed_reacquisition)
 
     @staticmethod
     def _counterfactual_distances(
@@ -1268,6 +1271,7 @@ class _NearClosedBase:
             track.lifecycle = Lifecycle.RECOVERED
             if track.belief is not None:
                 track.belief.lifecycle = Lifecycle.RECOVERED
+        self.last_measurement_context[track.track_id] = raw[column]
         if self.arena is not None:
             self.arena.record_hit(bbox_center(observation.bbox_xywh), weight=max(quality, 0.1))
 
@@ -1326,6 +1330,7 @@ class _NearClosedBase:
             observations[column], raw[column], graph[column], bootstrap=bootstrap
         )
         self._tracks.append(track)
+        self.last_measurement_context[track.track_id] = raw[column]
         if self.arena is not None:
             self.arena.record_hit(bbox_center(observations[column].bbox_xywh))
         state = integrity[column]
@@ -1362,6 +1367,7 @@ class _NearClosedBase:
         track.keypoint_scores = None
         track.pose_source = None
         track.association_quality = 0.0
+        self.last_measurement_context[track.track_id] = None
 
         removable = (
             track.time_since_update > self.config.base.max_age
@@ -1471,6 +1477,7 @@ class _NearClosedBase:
             clutters = ()
 
         self.last_diagnostics = []
+        self.last_measurement_context = {}
         observed_ids: set[int] = set()
         for row, column in matches:
             self._match(frame, row, column, accepted, raw, graph, integrity, matrices)
@@ -1576,7 +1583,15 @@ class PSICTracker:
         )
 
     def update(self, frame: int, observations: Sequence[Observation]) -> list[TrackOutput]:
-        return self._implementation.update(frame, observations)
+        integrity = self._implementation.integrity_model
+        owns_scope = not integrity.frame_active
+        if owns_scope:
+            integrity.begin_frame()
+        try:
+            return self._implementation.update(frame, observations)
+        finally:
+            if owns_scope:
+                integrity.end_frame()
 
     def __getattr__(self, name: str):
         return getattr(self._implementation, name)

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
+from typing import Mapping
 
 import numpy as np
 
 
 class ObservationSource(str, Enum):
+    MANUAL_GT = "manual_gt"
+    INTERPOLATED_GT = "interpolated_gt"
     PREDICTION = "prediction"
     PROPAGATED = "propagated"
 
@@ -153,3 +157,23 @@ class TrackOutput:
                 "keypoint_scores",
                 _readonly_float_array(self.keypoint_scores, name="keypoint_scores"),
             )
+
+
+@dataclass(frozen=True)
+class MeasurementRecord:
+    frame: int
+    track_id: int
+    valid: bool
+    source: ObservationSource
+    values: Mapping[str, float] = field(default_factory=dict)
+    uncertainties: Mapping[str, float] = field(default_factory=dict)
+    metric_validity: Mapping[str, bool] = field(default_factory=dict)
+    states: Mapping[str, str] = field(default_factory=dict)
+    contributing_start_frame: int | None = None
+    contributing_end_frame: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+        object.__setattr__(self, "uncertainties", MappingProxyType(dict(self.uncertainties)))
+        object.__setattr__(self, "metric_validity", MappingProxyType(dict(self.metric_validity)))
+        object.__setattr__(self, "states", MappingProxyType(dict(self.states)))

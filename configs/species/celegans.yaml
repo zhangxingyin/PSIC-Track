@@ -5,3 +5,4 @@ keypoints:
 skeleton:
   [[0, 1], [1, 2], [2, 3], [3, 4]]
 body_axis: [0, 4]
+pose_consistency_scale: 0.02

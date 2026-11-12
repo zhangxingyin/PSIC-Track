@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from typing import Any
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -12,7 +15,7 @@ import yaml
 from .association import GaussianPose
 from .config import ObservationIntegrityConfig, PoseConfig
 from .types import Observation, UpdateMode
-# Numerical safeguards and fixed pose-memory model constants.
+# Fixed model definition and floating-point safeguards; not tuning knobs.
 _NUMERICAL_EPS = np.finfo(np.float64).eps
 _POSE_VARIANCE_FLOOR = 1e-8
 _POSE_VARIANCE_CEILING = 25.0
@@ -47,6 +50,7 @@ class SpeciesTopology:
     keypoints: tuple[str, ...]
     skeleton: tuple[tuple[int, int], ...]
     body_axis: tuple[int, int]
+    pose_consistency_scale: float
 
     @property
     def keypoint_count(self) -> int:
@@ -63,11 +67,15 @@ class SpeciesTopology:
         body_axis = tuple(int(value) for value in payload["body_axis"])
         if len(body_axis) != 2 or any(index < 0 or index >= count for index in body_axis):
             raise ValueError("body_axis must contain two valid keypoint indices")
+        pose_consistency_scale = float(payload["pose_consistency_scale"])
+        if not np.isfinite(pose_consistency_scale) or pose_consistency_scale <= 0.0:
+            raise ValueError("pose_consistency_scale must be a positive finite scalar")
         return cls(
             species=str(payload["species"]),
             keypoints=keypoints,
             skeleton=skeleton,
             body_axis=(body_axis[0], body_axis[1]),
+            pose_consistency_scale=pose_consistency_scale,
         )
 
 
@@ -119,7 +127,7 @@ class PoseEncoder:
         )
         normalized_outside = outside / np.maximum(bbox[2:], _NUMERICAL_EPS)
         consistency_scale = max(
-            0.02, np.sqrt(_NUMERICAL_EPS)
+            float(self.topology.pose_consistency_scale), np.sqrt(_NUMERICAL_EPS)
         )
         inside_probability = np.exp(
             -0.5 * np.sum(np.square(normalized_outside / consistency_scale), axis=1)
@@ -133,7 +141,7 @@ class PoseEncoder:
 
         point_variance = np.full(
             point_count,
-            0.02 ** 2,
+            float(self.topology.pose_consistency_scale) ** 2,
             dtype=np.float64,
         ) / np.maximum(scores, _NUMERICAL_EPS)
         point_variance = np.clip(
@@ -290,11 +298,39 @@ def spectral_energy_features(
 
 
 class GraphPoseEncoder:
-    """Encode a supplied body topology into one shared graph-spectral state."""
+    """Encode any SpaceAnimal topology into one shared graph-spectral state."""
 
     def __init__(self, topology: SpeciesTopology, config: PoseConfig):
         self.topology = topology
         self.config = config
+        self.cache_size = 64
+        self._spectral_cache = OrderedDict()
+        self.spectral_computations = 0
+        self.spectral_cache_hits = 0
+
+    @property
+    def cached_pattern_count(self):
+        return len(self._spectral_cache)
+
+    def _basis(self, indices):
+        key = tuple(indices.tolist())
+        if key in self._spectral_cache:
+            self._spectral_cache.move_to_end(key)
+            self.spectral_cache_hits += 1
+            return self._spectral_cache[key]
+        laplacian, edge_count = self._valid_laplacian(indices)
+        if edge_count:
+            eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
+            eigenvalues.setflags(write=False)
+            eigenvectors.setflags(write=False)
+            self.spectral_computations += 1
+        else:
+            eigenvalues = eigenvectors = None
+        result = (edge_count, eigenvalues, eigenvectors)
+        self._spectral_cache[key] = result
+        if len(self._spectral_cache) > self.cache_size:
+            self._spectral_cache.popitem(last=False)
+        return result
 
     def _valid_laplacian(self, valid_indices: np.ndarray) -> tuple[np.ndarray, int]:
         lookup = {int(original): local for local, original in enumerate(valid_indices.tolist())}
@@ -314,7 +350,7 @@ class GraphPoseEncoder:
         )
         return (laplacian + laplacian.T) / 2.0, edge_count
 
-    def encode(self, observation: Observation) -> GraphPoseEvidence:
+    def encode(self, observation):
         if observation.keypoints is None or observation.keypoint_scores is None:
             raise ValueError("graph pose encoding requires keypoints and scores")
         if observation.keypoints.shape[0] != self.topology.keypoint_count:
@@ -328,18 +364,14 @@ class GraphPoseEncoder:
         lower = bbox[:2]
         upper = bbox[:2] + bbox[2:]
         outside = np.maximum(
-            np.maximum(lower - observation.keypoints, observation.keypoints - upper),
-            0.0,
+            np.maximum(lower - observation.keypoints, observation.keypoints - upper), 0.0,
         )
         normalized_outside = outside / np.maximum(bbox[2:], _NUMERICAL_EPS)
-        consistency_scale = max(
-            0.02, np.sqrt(_NUMERICAL_EPS)
-        )
+        consistency_scale = max(float(self.topology.pose_consistency_scale), np.sqrt(_NUMERICAL_EPS))
         inside_probability = np.exp(
             -0.5 * np.sum(np.square(normalized_outside / consistency_scale), axis=1)
         )
         indices = np.flatnonzero(valid)
-
         mean = np.zeros(8, dtype=np.float64)
         valid_mask = np.zeros(8, dtype=bool)
         diagonal = np.full(8, _POSE_VARIANCE_CEILING, dtype=np.float64)
@@ -347,27 +379,17 @@ class GraphPoseEncoder:
         if indices.size >= 2:
             valid_points = points[indices]
             weights = np.clip(scores[indices], _NUMERICAL_EPS, 1.0)
-            centroid = np.average(
-                valid_points, axis=0, weights=weights
-            )
+            centroid = np.average(valid_points, axis=0, weights=weights)
             centered = valid_points - centroid
-            laplacian, edge_count = self._valid_laplacian(indices)
+            edge_count, eigenvalues, eigenvectors = self._basis(indices)
             if edge_count > 0:
-                eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
                 mean[:6] = spectral_energy_features(eigenvalues, eigenvectors, centered)
                 valid_mask[:6] = True
-                point_uncertainty = float(
-                    np.mean(
-                        (0.02 ** 2)
-                        / np.maximum(scores[indices], _NUMERICAL_EPS)
-                    )
-                )
-                diagonal[:6] = np.clip(
-                    point_uncertainty,
-                    _POSE_VARIANCE_FLOOR,
-                    _POSE_VARIANCE_CEILING,
-                )
-
+                point_uncertainty = float(np.mean(
+                    (float(self.topology.pose_consistency_scale) ** 2)
+                    / np.maximum(scores[indices], _NUMERICAL_EPS)
+                ))
+                diagonal[:6] = np.clip(point_uncertainty, _POSE_VARIANCE_FLOOR, _POSE_VARIANCE_CEILING)
         axis_left, axis_right = self.topology.body_axis
         axis = points[axis_right] - points[axis_left]
         axis_length = float(np.linalg.norm(axis))
@@ -375,36 +397,23 @@ class GraphPoseEncoder:
             mean[6:8] = axis / axis_length
             valid_mask[6:8] = True
             axis_indices = np.asarray([axis_left, axis_right], dtype=int)
-            axis_uncertainty = float(
-                np.mean(
-                    (0.02 ** 2)
-                    / np.maximum(scores[axis_indices], _NUMERICAL_EPS)
-                )
-            )
+            axis_uncertainty = float(np.mean(
+                (float(self.topology.pose_consistency_scale) ** 2)
+                / np.maximum(scores[axis_indices], _NUMERICAL_EPS)
+            ))
             diagonal[6:8] = np.clip(
                 axis_uncertainty / max(axis_length * axis_length, _NUMERICAL_EPS),
-                _POSE_VARIANCE_FLOOR,
-                _POSE_VARIANCE_CEILING,
+                _POSE_VARIANCE_FLOOR, _POSE_VARIANCE_CEILING,
             )
-
         coverage = float(indices.size / max(self.topology.keypoint_count, 1))
-        confidence = (
-            float(np.mean(np.clip(scores[indices], 0.0, 1.0)))
-            if indices.size
-            else 0.0
-        )
-        inside_quality = (
-            float(np.mean(inside_probability[indices])) if indices.size else 0.0
-        )
-        connectivity = float(
-            np.clip(2.0 * edge_count / max(indices.size, 1), 0.0, 1.0)
-        )
+        confidence = float(np.mean(np.clip(scores[indices], 0.0, 1.0))) if indices.size else 0.0
+        inside_quality = float(np.mean(inside_probability[indices])) if indices.size else 0.0
+        connectivity = float(np.clip(2.0 * edge_count / max(indices.size, 1), 0.0, 1.0))
         quality = coverage * confidence * inside_quality * connectivity
         if indices.size < 2 or edge_count == 0:
             valid_mask[:] = False
             quality = 0.0
-        covariance = np.diag(diagonal)
-        return GraphPoseEvidence(mean, covariance, valid_mask, float(np.clip(quality, 0.0, 1.0)))
+        return GraphPoseEvidence(mean, np.diag(diagonal), valid_mask, float(np.clip(quality, 0.0, 1.0)))
 
 
 def graph_pose_distance(left: GraphPoseEvidence, right: GraphPoseEvidence) -> float:
@@ -574,58 +583,80 @@ class ObservationIntegrityModel:
     def __init__(self, config: ObservationIntegrityConfig):
         config.validate()
         self.config = config
+        self.frame_active = False
+        self.computed_affinities = 0
+        self.cache_hits = 0
+        self._cache_key: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self._cached_inputs: tuple[tuple[Any, ...], tuple[Any, ...]] | None = None
+        self._cached_value: np.ndarray | None = None
 
-    def duplicate_affinity(
-        self,
-        observations: Sequence[Observation],
-        graph_poses: Sequence[GraphPoseEvidence | None],
-    ) -> np.ndarray:
-        """Continuous probability that two detections explain the same body."""
+    def begin_frame(self) -> None:
+        if self.frame_active:
+            raise RuntimeError("frame-local affinity scope is already active")
+        self.frame_active = True
+        self._clear_cache()
 
+    def end_frame(self) -> None:
+        self._clear_cache()
+        self.frame_active = False
+
+    def _clear_cache(self) -> None:
+        self._cache_key = None
+        self._cached_inputs = None
+        self._cached_value = None
+
+    def _calculate_affinity(self, observations, graph_poses):
         if len(observations) != len(graph_poses):
-            raise ValueError("one graph pose entry is required per observation")
+            raise ValueError('one graph pose entry is required per observation')
         count = len(observations)
         affinity = np.zeros((count, count), dtype=np.float64)
         if not self.config.enabled:
             return affinity
+        # Current GraphPoseEncoder observations have nonnegative diagonal
+        # covariance. Other covariance forms retain the exact scalar path.
+        safe = []
+        for pose in graph_poses:
+            if pose is None or pose.quality <= 0:
+                safe.append(True)
+                continue
+            diagonal = np.diag(pose.covariance)
+            safe.append(bool(np.all(diagonal >= 0)
+                             and np.array_equal(pose.covariance, np.diag(diagonal))))
         for left in range(count):
-            for right in range(left + 1, count):
-                overlap = _overlap_min_area(
-                    observations[left].bbox_xywh, observations[right].bbox_xywh
-                )
-                center = _center_distance(
-                    observations[left].bbox_xywh, observations[right].bbox_xywh
-                )
+            for right in range(left+1, count):
+                overlap = _overlap_min_area(observations[left].bbox_xywh, observations[right].bbox_xywh)
+                center = _center_distance(observations[left].bbox_xywh, observations[right].bbox_xywh)
                 left_pose, right_pose = graph_poses[left], graph_poses[right]
-                if (
-                    left_pose is not None
-                    and right_pose is not None
-                    and min(left_pose.quality, right_pose.quality) > 0.0
-                ):
+                qualified = (left_pose is not None and right_pose is not None
+                             and min(left_pose.quality, right_pose.quality) > 0)
+                if overlap == 0.0 and np.isfinite(center) and (not qualified or (safe[left] and safe[right])):
+                    continue
+                if qualified:
                     distance = graph_pose_distance(left_pose, right_pose)
-                    pose_agreement = (
-                        0.0
-                        if not np.isfinite(distance)
-                        else float(np.exp(-0.5 * distance))
-                    )
+                    pose_agreement = 0.0 if not np.isfinite(distance) else float(np.exp(-.5*distance))
                 else:
-                    pose_agreement = 0.5
-                occupancy_agreement = _keypoint_occupancy_agreement(
-                    observations[left], observations[right]
-                )
-                if occupancy_agreement is not None:
-                    pose_agreement = max(pose_agreement, occupancy_agreement)
-                center_likelihood = float(np.exp(-0.5 * center * center))
-                strength = float(
-                    np.clip(
-                        overlap * center_likelihood * pose_agreement,
-                        0.0,
-                        1.0,
-                    )
-                )
+                    pose_agreement = .5
+                occupancy = _keypoint_occupancy_agreement(observations[left], observations[right])
+                if occupancy is not None:
+                    pose_agreement = max(pose_agreement, occupancy)
+                likelihood = float(np.exp(-.5*center*center))
+                strength = float(np.clip(overlap*likelihood*pose_agreement, 0., 1.))
                 affinity[left, right] = strength
                 affinity[right, left] = strength
         return affinity
+
+    def duplicate_affinity(self, observations, graph_poses):
+        key = (tuple(id(value) for value in observations), tuple(id(value) for value in graph_poses))
+        if self.frame_active and key == self._cache_key:
+            self.cache_hits += 1
+            return self._cached_value.copy()
+        result = self._calculate_affinity(observations, graph_poses)
+        self.computed_affinities += 1
+        if self.frame_active:
+            self._cached_inputs = (tuple(observations), tuple(graph_poses))
+            self._cache_key = key
+            self._cached_value = result.copy()
+        return result
 
     def assess(
         self,
